@@ -112,7 +112,8 @@ def build_feature_matrix(
 ) -> pd.DataFrame:
     """
     Combine price features for a specific asset with global macro features.
-    Standardize all features to zero mean / unit variance before combining.
+    Apply asset-class-specific macro relevance weights so that bonds focus on
+    yield curve / monetary policy while commodities focus on oil / copper.
 
     Returns a DataFrame where each row is a week and each column is a feature.
     """
@@ -130,11 +131,23 @@ def build_feature_matrix(
     pf = pf.loc[common_idx]
     mf = mf.loc[common_idx]
 
+    # ── Apply asset-class-specific macro relevance weights ──
+    asset_class = cfg.ETF_UNIVERSE.get(ticker, {}).get("class", "equity")
+    relevance = getattr(cfg, "MACRO_RELEVANCE", {}).get(asset_class, {})
+
+    if relevance:
+        for col in mf.columns:
+            weight = relevance.get(col, 1.0)
+            if weight == 0.0:
+                mf = mf.drop(columns=col)
+            else:
+                mf[col] = mf[col] * weight
+
     # Standardize price features (rolling z-score to avoid look-ahead)
     pf_std = _rolling_standardize(pf, window=cfg.MACRO_ZSCORE_WINDOW)
 
     # Macro features are already z-scored & winsorized by compute_macro_features
-    # (following Mulliner et al.) — do NOT re-standardize.
+    # (following Mulliner et al.). The relevance weights above further scale them.
     mf_std = mf
 
     # Weight: 60% price, 40% macro (Heiden)
@@ -143,10 +156,8 @@ def build_feature_matrix(
 
     if n_price > 0 and n_macro > 0:
         # Scale so that combined squared distances reflect the 60/40 split.
-        # Each price feature contributes PRICE_WEIGHT / n_price to total variance;
-        # each macro feature contributes MACRO_WEIGHT / n_macro.
         price_scale = np.sqrt(cfg.PRICE_WEIGHT / n_price)
-        macro_scale = np.sqrt(cfg.MACRO_WEIGHT / n_macro)
+        macro_scale = np.sqrt(cfg.MACRO_WEIGHT / max(n_macro, 1))
         pf_std = pf_std * price_scale
         mf_std = mf_std * macro_scale
 
@@ -231,12 +242,15 @@ def get_forward_returns(
     prices_weekly: pd.Series,
     feature_dates: pd.DatetimeIndex,
     analogue_indices: np.ndarray,
+    analogue_distances: np.ndarray = None,
     horizons: List[int] = None,
-) -> Dict[int, np.ndarray]:
+) -> Dict[int, dict]:
     """
     For each analogue date, compute forward returns at each horizon.
+    If distances are provided and DISTANCE_WEIGHTED is True, also
+    compute distance-based weights for each analogue.
 
-    Returns: { horizon_weeks: array of forward returns }
+    Returns: { horizon_weeks: {"returns": array, "weights": array} }
     """
     if horizons is None:
         horizons = cfg.FORWARD_HORIZONS
@@ -246,7 +260,8 @@ def get_forward_returns(
 
     for h in horizons:
         fwd_rets = []
-        for idx in analogue_indices:
+        fwd_weights = []
+        for i, idx in enumerate(analogue_indices):
             if idx >= len(feature_dates):
                 continue
             date = feature_dates[idx]
@@ -259,8 +274,19 @@ def get_forward_returns(
                 p_future = prices.iloc[future_loc]
                 if p_now > 0 and not np.isnan(p_now) and not np.isnan(p_future):
                     fwd_rets.append(p_future / p_now - 1)
+                    # Weight by inverse distance (closer = higher weight)
+                    if analogue_distances is not None and i < len(analogue_distances):
+                        d = analogue_distances[i]
+                        fwd_weights.append(1.0 / (d + 1e-6))  # avoid div by zero
+                    else:
+                        fwd_weights.append(1.0)
 
-        results[h] = np.array(fwd_rets) if fwd_rets else np.array([])
+        rets = np.array(fwd_rets) if fwd_rets else np.array([])
+        wts = np.array(fwd_weights) if fwd_weights else np.array([])
+        # Normalize weights to sum to len(rets) so mean calculations stay interpretable
+        if len(wts) > 0 and wts.sum() > 0:
+            wts = wts / wts.sum() * len(wts)
+        results[h] = {"returns": rets, "weights": wts}
 
     return results
 
@@ -270,11 +296,14 @@ def get_forward_returns(
 # ══════════════════════════════════════════════════
 
 def classify_asset(
-    forward_returns: Dict[int, np.ndarray],
+    forward_returns: Dict[int, dict],
     horizon_weights: List[float] = None,
 ) -> Dict:
     """
     Classify an asset as Alive, Dead, or Ambiguous based on analogue evidence.
+
+    forward_returns: { horizon: {"returns": array, "weights": array} }
+                     or legacy { horizon: array }
 
     Returns dict with:
         "status": "alive" | "dead" | "ambiguous"
@@ -295,16 +324,39 @@ def classify_asset(
     total_weight = 0.0
     total_analogues = 0
 
+    use_dist_weights = getattr(cfg, "DISTANCE_WEIGHTED", False)
+
     for h, w in zip(horizons, horizon_weights):
-        rets = forward_returns.get(h, np.array([]))
+        raw = forward_returns.get(h, {})
+
+        # Support both new format {"returns":..., "weights":...} and legacy (plain array)
+        if isinstance(raw, dict):
+            rets = raw.get("returns", np.array([]))
+            dist_wts = raw.get("weights", np.ones_like(rets))
+        else:
+            rets = raw
+            dist_wts = np.ones_like(rets)
+
         if len(rets) < cfg.ALIVE_MIN_ANALOGUES:
             detail[h] = {"n": len(rets), "mean": np.nan, "tstat": np.nan, "hit": np.nan}
             continue
 
-        mean_ret = np.mean(rets)
-        std_ret = np.std(rets, ddof=1)
-        tstat = mean_ret / (std_ret / np.sqrt(len(rets))) if std_ret > 0 else 0
-        hit_rate = np.mean(rets > 0)
+        if use_dist_weights and len(dist_wts) == len(rets) and dist_wts.sum() > 0:
+            # Distance-weighted mean and statistics
+            norm_wts = dist_wts / dist_wts.sum()
+            mean_ret = np.average(rets, weights=norm_wts)
+            # Weighted std
+            var_ret = np.average((rets - mean_ret) ** 2, weights=norm_wts)
+            std_ret = np.sqrt(var_ret)
+            # Effective sample size for t-stat (Kish's formula)
+            n_eff = (dist_wts.sum() ** 2) / (dist_wts ** 2).sum()
+            tstat = mean_ret / (std_ret / np.sqrt(n_eff)) if std_ret > 0 else 0
+            hit_rate = np.average(rets > 0, weights=norm_wts)
+        else:
+            mean_ret = np.mean(rets)
+            std_ret = np.std(rets, ddof=1)
+            tstat = mean_ret / (std_ret / np.sqrt(len(rets))) if std_ret > 0 else 0
+            hit_rate = np.mean(rets > 0)
 
         detail[h] = {
             "n": len(rets),

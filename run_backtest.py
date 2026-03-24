@@ -158,9 +158,10 @@ def run_backtest() -> dict:
             if len(analogue_idx) < cfg.MIN_ANALOGUES:
                 continue
 
-            # Get forward returns for analogues
+            # Get forward returns for analogues (with distance weights)
             fwd_rets = sch.get_forward_returns(
-                etf_weekly[ticker], feat_matrix.index, analogue_idx
+                etf_weekly[ticker], feat_matrix.index, analogue_idx,
+                analogue_distances=distances,
             )
 
             # Classify
@@ -192,6 +193,19 @@ def run_backtest() -> dict:
     equity_curve = pd.Series(equity, index=equity_dates, name="Schrodinger")
 
     weights_df = pd.DataFrame(weights_history).set_index("date").fillna(0)
+
+    # ── Summary statistics ──
+    alive_per_week = [
+        sum(1 for v in ch["classifications"].values() if v["status"] == "alive")
+        for ch in classifications_history
+    ]
+    invested_per_week = [sum(ch["weights"].values()) for ch in classifications_history]
+    n_alive = np.array(alive_per_week)
+    n_invested = np.array(invested_per_week)
+    print(f"\n  --- Allocation Summary ---")
+    print(f"  Avg alive assets/week:   {n_alive.mean():.1f}")
+    print(f"  Avg invested weight:     {n_invested.mean():.1%}")
+    print(f"  Weeks fully in cash:     {(n_invested == 0).sum()} ({(n_invested == 0).mean():.0%})")
 
     # Benchmark: SPY buy-and-hold
     spy_prices = etf_weekly["SPY"].dropna()

@@ -76,8 +76,8 @@ FRED_YAHOO_FALLBACKS = {
 # FEATURE ENGINEERING
 # ─────────────────────────────────────────────
 # Price features per asset (weekly)
-PRICE_MOMENTUM_WINDOWS  = [4, 8, 12, 26]    # weeks
-PRICE_VOLATILITY_WINDOWS = [4, 12]           # weeks
+PRICE_MOMENTUM_WINDOWS  = [4, 12, 26]        # weeks (dropped 8w — too correlated with 4/12)
+PRICE_VOLATILITY_WINDOWS = [12]              # weeks (one vol measure is enough)
 PRICE_DRAWDOWN_WINDOW    = 52                # weeks (high-water mark lookback)
 
 # Macro feature transformation (following Mulliner)
@@ -92,16 +92,51 @@ STOCK_BOND_CORR_WINDOW  = 156   # weeks (~3 years, per Mulliner)
 PRICE_WEIGHT = 0.6
 MACRO_WEIGHT = 0.4
 
+# Asset-class-specific macro feature relevance
+# Each value is a weight multiplier for that macro variable when building features for that class.
+# 0.0 = ignore, 1.0 = full weight, 0.5 = half weight
+# This prevents bonds from matching on copper or commodities from matching on stock-bond corr.
+MACRO_RELEVANCE = {
+    "equity": {
+        "macro_market": 1.0, "macro_yield_curve": 1.0, "macro_oil": 0.3,
+        "macro_copper": 0.3, "macro_monetary": 0.8, "macro_volatility": 1.0,
+        "macro_stock_bond": 0.5,
+    },
+    "fixed_income": {
+        "macro_market": 0.3, "macro_yield_curve": 1.0, "macro_oil": 0.2,
+        "macro_copper": 0.0, "macro_monetary": 1.0, "macro_volatility": 0.5,
+        "macro_stock_bond": 1.0,
+    },
+    "sector": {
+        "macro_market": 1.0, "macro_yield_curve": 0.8, "macro_oil": 0.8,
+        "macro_copper": 0.5, "macro_monetary": 0.8, "macro_volatility": 1.0,
+        "macro_stock_bond": 0.3,
+    },
+    "commodity": {
+        "macro_market": 0.3, "macro_yield_curve": 0.5, "macro_oil": 1.0,
+        "macro_copper": 1.0, "macro_monetary": 0.8, "macro_volatility": 0.5,
+        "macro_stock_bond": 0.0,
+    },
+    "currency": {
+        "macro_market": 0.5, "macro_yield_curve": 1.0, "macro_oil": 0.5,
+        "macro_copper": 0.3, "macro_monetary": 1.0, "macro_volatility": 0.5,
+        "macro_stock_bond": 0.3,
+    },
+}
+
 # ─────────────────────────────────────────────
 # ANALOGUE ENGINE
 # ─────────────────────────────────────────────
 # Distance metric
 DISTANCE_METRIC = "euclidean"  # "euclidean" or "mahalanobis"
 
+# Distance weighting: weight analogues by 1/distance when computing forward returns
+DISTANCE_WEIGHTED = True  # True = closer analogues count more; False = uniform (original)
+
 # Analogue selection
 ANALOGUE_PCT       = 0.15      # Top 15% most similar (Mulliner default)
 MIN_ANALOGUES      = 20        # Minimum analogues to form a view
-EXCLUSION_WINDOW   = 156       # Exclude last 3 years (156 weeks) per Mulliner
+EXCLUSION_WINDOW   = 52        # Exclude last 1 year (52 weeks) — compromise between Mulliner (3y) and no exclusion
 
 # Forward horizons for conditional forecasts
 FORWARD_HORIZONS   = [4, 8, 12]          # weeks
@@ -113,15 +148,15 @@ HORIZON_WEIGHTS    = [0.50, 0.30, 0.20]  # heavier on near-term (Heiden: "4 > 8 
 # An asset is "Alive" if ALL conditions are met:
 ALIVE_MIN_ANALOGUES     = 20    # Enough historical matches
 ALIVE_HIT_RATE          = 0.55  # >55% of analogue forward returns positive
-ALIVE_MIN_RETURN        = 0.005 # Blended expected return > 0.5% (annualized would be much higher)
-ALIVE_MIN_CONFIDENCE    = 1.0   # t-stat of mean return > 1.0 (relaxed; Heiden seems pragmatic)
+ALIVE_MIN_RETURN        = 0.002 # Blended expected return > 0.2%
+ALIVE_MIN_CONFIDENCE    = 0.5   # t-stat of mean return > 0.5 (relaxed from original 1.0)
 
 # ─────────────────────────────────────────────
 # PORTFOLIO CONSTRUCTION
 # ─────────────────────────────────────────────
 # Position sizing
 SIZING_METHOD       = "signal_strength"   # rank by blended expected return / vol
-LOGIT_POWER         = 1.5                 # logit-power transform exponent
+LOGIT_POWER         = 3.0                 # logit-power transform exponent (was 1.5 — concentrate in top picks)
 MAX_POSITION_WEIGHT = 0.40                # 40% cap per ETF
 MIN_POSITION_WEIGHT = 0.02                # 2% floor (below this → zero)
 
